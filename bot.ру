@@ -1,0 +1,298 @@
+import asyncio
+import time
+from collections import deque
+from pyrogram import Client, filters, enums
+from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+from pyrogram.errors import SessionPasswordNeeded, FloodWait, UserNotParticipant
+import aiosqlite
+
+BOT_TOKEN = "8595895020:AAFL-NEnwa83eoh2vaMZUvG7zRdHWlIcoOA"
+ADMIN_ID = 8724732477
+CHANNEL_URL = "https://t.me/swithub"
+CHANNEL_ID = "swithub"
+BOT_USERNAME = ""
+
+API_ID = 6
+API_HASH = "eb06d4abfb49dc3eeb1aeb98ae0f581e"
+
+bot = Client("main_bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
+
+# Кэш теперь привязан только к уникальному ID сообщения
+msg_cache = {}
+cache_queue = deque(maxlen=10000)
+
+active_userbots = {}
+auth_steps = {}
+
+async def init_db():
+    async with aiosqlite.connect("database.db") as db:
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS users (
+                user_id INTEGER PRIMARY KEY,
+                premium_until INTEGER DEFAULT 0,
+                is_banned INTEGER DEFAULT 0,
+                session_string TEXT DEFAULT NULL,
+                auto_reply_text TEXT DEFAULT 'Привет! Я сейчас занят, отвечу позже.',
+                auto_reply_on INTEGER DEFAULT 0
+            )
+        """)
+        await db.commit()
+
+async def get_user(user_id):
+    async with aiosqlite.connect("database.db") as db:
+        async with db.execute("SELECT premium_until, is_banned, session_string, auto_reply_text, auto_reply_on FROM users WHERE user_id = ?", (user_id,)) as cursor:
+            return await cursor.fetchone()
+
+async def add_user(user_id):
+    async with aiosqlite.connect("database.db") as db:
+        await db.execute("INSERT OR IGNORE INTO users (user_id) VALUES (?)", (user_id,))
+        await db.commit()
+
+async def update_user(user_id, field, value):
+    async with aiosqlite.connect("database.db") as db:
+        await db.execute(f"UPDATE users SET {field} = ? WHERE user_id = ?", (value, user_id))
+        await db.commit()
+
+async def get_all_users():
+    async with aiosqlite.connect("database.db") as db:
+        async with db.execute("SELECT user_id FROM users") as cursor:
+            return [row[0] for row in await cursor.fetchall()]
+
+async def check_sub(client, user_id):
+    if user_id == ADMIN_ID: return True
+    try:
+        member = await client.get_chat_member(CHANNEL_ID, user_id)
+        return member.status not in [enums.ChatMemberStatus.LEFT, enums.ChatMemberStatus.BANNED]
+    except UserNotParticipant:
+        return False
+    except Exception:
+        return True
+
+def sub_kb():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("➕ Подписаться", url=CHANNEL_URL)],
+        [InlineKeyboardButton("🔄 Проверить", callback_data="check_sub")]
+    ])
+
+def main_menu_kb(is_admin=False, is_connected=False):
+    kb = [
+        [InlineKeyboardButton("🎓 Чем это полезно?", callback_data="info")],
+        [InlineKeyboardButton("💬 Канал проекта", url=CHANNEL_URL), 
+         InlineKeyboardButton("🛠 Гайд новичкам", callback_data="guide")],
+        [InlineKeyboardButton("👤 Мой профиль", callback_data="profile")]
+    ]
+    if not is_connected:
+        kb.append([InlineKeyboardButton("🔗 Подключить аккаунт", callback_data="connect_account")])
+    else:
+        kb.append([InlineKeyboardButton("🤖 Настройки Автоответчика", callback_data="auto_reply_menu")])
+        kb.append([InlineKeyboardButton("🛑 Отключить аккаунт", callback_data="disconnect_account")])
+        
+    kb.append([InlineKeyboardButton("🔓 Подписка", callback_data="buy_sub"),
+               InlineKeyboardButton("💰 Партнерка", callback_data="partner")])
+    if is_admin:
+        kb.append([InlineKeyboardButton("🛠 Админ Панель", callback_data="admin_panel")])
+    return InlineKeyboardMarkup(kb)
+
+def auto_reply_kb(is_on):
+    status_btn = "🔴 Выключить" if is_on else "🟢 Включить"
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton(status_btn, callback_data="toggle_ar")],
+        [InlineKeyboardButton("📝 Изменить текст", callback_data="edit_ar_text")],
+        [InlineKeyboardButton("🔙 Назад", callback_data="start")]
+    ])
+
+async def start_userbot(user_id, session_string):
+    if user_id in active_userbots:
+        return True
+    
+    client = Client(f"user_{user_id}", session_string=session_string, in_memory=True)
+    
+    # Слушаем ТОЛЬКО личные чаты (private)
+    @client.on_message(filters.private & ~filters.me)
+    async def handle_incoming(c, m):
+        # 1. Автоответчик
+        user_data = await get_user(user_id)
+        if user_data and user_data[4]: # auto_reply_on == 1
+            try:
+                await m.reply(user_data[3]) # auto_reply_text
+            except: pass
+
+        # 2. Сохранение в кэш
+        if m.text or m.caption:
+            text = m.text or m.caption
+            msg_cache[m.id] = text
+            cache_queue.append(m.id)
+
+    @client.on_edited_message(filters.private & ~filters.me)
+    async def catch_edit(c, m):
+        old_text = msg_cache.get(m.id, "Неизвестно (не было в кэше)")
+        new_text = m.text or m.caption
+        if old_text == new_text: return
+        
+        msg_cache[m.id] = new_text
+        user_link = f"@{m.from_user.username}" if m.from_user and m.from_user.username else m.from_user.first_name if m.from_user else "Неизвестный"
+        
+        text = (f"✏️ **Изменено сообщение пользователя**\n{user_link}\n\n"
+                f"**Старый текст:** ⏳ {old_text}\n"
+                f"**Новый текст:** 🦋 {new_text}\n"
+                f"[Перейти в чат]({m.link})")
+        try:
+            await bot.send_message(user_id, text, disable_web_page_preview=True)
+        except: pass
+
+    @client.on_deleted_messages()
+    async def catch_delete(c, messages):
+        for m in messages:
+            if m.id in msg_cache:
+                deleted_text = msg_cache.pop(m.id)
+                text = f"🗑 **Удалено сообщение в ЛС**\n\n**Текст:** {deleted_text}"
+                try:
+                    await bot.send_message(user_id, text)
+                except: pass
+
+    try:
+        await client.start()
+        active_userbots[user_id] = client
+        
+        # Обновление био (в блоке try-except, чтобы не крашило при ошибке)
+        try:
+            me = await client.get_me()
+            current_bio = me.bio or ""
+            new_bio = current_bio + " | user @swithub_robot"
+            if len(new_bio) <= 70 and "swithub" not in current_bio.lower():
+                await client.update_profile(bio=new_bio)
+        except Exception as e:
+            print(f"Не удалось обновить био для {user_id}: {e}")
+            
+        await bot.send_message(user_id, "✅ Аккаунт успешно подключен! Слушаю личные сообщения.")
+        return True
+    except Exception as e:
+        print(f"Ошибка запуска юзербота {user_id}: {e}")
+        await update_user(user_id, "session_string", None)
+        return False
+
+@bot.on_message(filters.command("start") & filters.private)
+async def start_cmd(client, message):
+    user_id = message.from_user.id
+    await add_user(user_id)
+    user_data = await get_user(user_id)
+    
+    if user_data[1] == 1: return await message.reply("❌ Вы заблокированы.")
+    if not await check_sub(client, user_id):
+        return await message.reply("Необходимо подписаться на канал!", reply_markup=sub_kb())
+
+    is_admin = (user_id == ADMIN_ID)
+    is_connected = bool(user_data[2])
+    
+    text = (f"👋 **Добро пожаловать, {message.from_user.first_name}**\n\n"
+            f"**Зеркало** - многофункциональный помощник в личных сообщениях.")
+    await message.reply(text, reply_markup=main_menu_kb(is_admin, is_connected))
+
+@bot.on_callback_query(filters.regex("start"))
+async def back_to_start(client, call):
+    user_data = await get_user(call.from_user.id)
+    is_admin = (call.from_user.id == ADMIN_ID)
+    is_connected = bool(user_data[2])
+    text = f"👋 **Добро пожаловать, {call.from_user.first_name}**\n\n**Зеркало** - многофункциональный помощник в личных сообщениях."
+    await call.message.edit_text(text, reply_markup=main_menu_kb(is_admin, is_connected))
+
+@bot.on_callback_query(filters.regex("auto_reply_menu"))
+async def auto_reply_menu(client, call):
+    user_data = await get_user(call.from_user.id)
+    text = f"🤖 **Настройки Автоответчика**\n\nТекущий текст:\n_«{user_data[3]}»_\n\nСтатус: {'Включен 🟢' if user_data[4] else 'Выключен 🔴'}"
+    await call.message.edit_text(text, reply_markup=auto_reply_kb(user_data[4]))
+
+@bot.on_callback_query(filters.regex("toggle_ar"))
+async def toggle_ar(client, call):
+    user_data = await get_user(call.from_user.id)
+    new_status = 0 if user_data[4] else 1
+    await update_user(call.from_user.id, "auto_reply_on", new_status)
+    await auto_reply_menu(client, call)
+
+@bot.on_callback_query(filters.regex("edit_ar_text"))
+async def edit_ar_text(client, call):
+    auth_steps[call.from_user.id] = {"step": "ar_text"}
+    await call.message.edit_text("✍️ Отправьте новый текст для автоответчика:")
+
+@bot.on_callback_query(filters.regex("connect_account"))
+async def connect_acc(client, call):
+    auth_steps[call.from_user.id] = {"step": "phone"}
+    await call.message.edit_text("📱 Отправьте номер телефона в формате `+79991234567`:")
+
+@bot.on_message(filters.private & filters.text)
+async def handle_text(client, message):
+    user_id = message.from_user.id
+    
+    if user_id in auth_steps:
+        step = auth_steps[user_id].get("step")
+        
+        if step == "ar_text":
+            await update_user(user_id, "auto_reply_text", message.text)
+            del auth_steps[user_id]
+            await message.reply("✅ Текст автоответчика обновлен!", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 В меню", callback_data="start")]]))
+            return
+
+        if step == "phone":
+            phone = message.text.replace(" ", "").replace("+", "")
+            msg = await message.reply("⏳ Запрос кода...")
+            user_client = Client(f"temp_{user_id}", api_id=API_ID, api_hash=API_HASH, in_memory=True)
+            await user_client.connect()
+            try:
+                code_info = await user_client.send_code(phone)
+                auth_steps[user_id] = {"step": "code", "client": user_client, "phone": phone, "hash": code_info.phone_code_hash}
+                await msg.edit_text("📩 Введите код через пробел (например: `1 2 3 4 5`):")
+            except Exception as e:
+                await msg.edit_text(f"❌ Ошибка: {e}")
+                del auth_steps[user_id]
+                
+        elif step == "code":
+            code = message.text.replace(" ", "").replace("-", "")
+            data = auth_steps[user_id]
+            user_client = data["client"]
+            msg = await message.reply("⏳ Проверяю...")
+            try:
+                await user_client.sign_in(data["phone"], data["hash"], code)
+                session = await user_client.export_session_string()
+                await update_user(user_id, "session_string", session)
+                await user_client.disconnect()
+                del auth_steps[user_id]
+                await msg.edit_text("✅ Успешно!")
+                await start_userbot(user_id, session)
+            except SessionPasswordNeeded:
+                auth_steps[user_id]["step"] = "password"
+                await msg.edit_text("🔐 Введите 2FA пароль:")
+            except Exception as e:
+                await msg.edit_text(f"❌ Ошибка: {e}")
+                del auth_steps[user_id]
+                
+        elif step == "password":
+            user_client = auth_steps[user_id]["client"]
+            msg = await message.reply("⏳ Проверяю пароль...")
+            try:
+                await user_client.check_password(message.text)
+                session = await user_client.export_session_string()
+                await update_user(user_id, "session_string", session)
+                await user_client.disconnect()
+                del auth_steps[user_id]
+                await msg.edit_text("✅ Успешно!")
+                await start_userbot(user_id, session)
+            except Exception as e:
+                await msg.edit_text(f"❌ Ошибка: {e}")
+                del auth_steps[user_id]
+
+async def load_sessions():
+    async with aiosqlite.connect("database.db") as db:
+        async with db.execute("SELECT user_id, session_string FROM users WHERE session_string IS NOT NULL") as cursor:
+            for row in await cursor.fetchall():
+                await start_userbot(row[0], row[1])
+
+async def main():
+    await init_db()
+    await bot.start()
+    await load_sessions()
+    print("🤖 Бот запущен без паники!")
+    while True: await asyncio.sleep(3600)
+
+if __name__ == "__main__":
+    loop = asyncio.get_event_loop()
+    loop.run_until_complete(main())
