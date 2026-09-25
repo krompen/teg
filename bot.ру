@@ -1,0 +1,474 @@
+import os
+import asyncio
+import time
+import random
+from collections import deque
+from pyrogram import Client, filters, enums
+from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+from pyrogram.errors import SessionPasswordNeeded, FloodWait
+import aiosqlite
+
+# === НАСТРОЙКИ ===
+BOT_TOKEN = "8595895020:AAFL-NEnwa83eoh2vaMZUvG7zRdHWlIcoOA"
+ADMIN_ID = 8724732477
+CHANNEL_URL = "https://t.me/swithub"
+CHANNEL_ID = "swithub"
+BOT_USERNAME = "swithub_robot"
+
+API_ID = 6
+API_HASH = "eb06d4abfb49dc3eeb1aeb98ae0f581e"
+SPAM_WORDS = ["купишь", "продам", "цена", "прайс", "покупаешь"]
+
+bot = Client("main_bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
+
+msg_cache = {}
+cache_queue = deque(maxlen=15000)
+active_userbots = {}
+auth_steps = {}
+captcha_states = {} # {user_id: int(ответ)}
+
+# === БАЗА ДАННЫХ ===
+async def init_db():
+    async with aiosqlite.connect("database.db") as db:
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS users (
+                user_id INTEGER PRIMARY KEY,
+                status TEXT DEFAULT 'new', -- 'new', 'pending', 'approved', 'banned'
+                is_connected INTEGER DEFAULT 0,
+                auto_reply_text TEXT DEFAULT 'Привет! Я сейчас занят, отвечу позже.',
+                auto_reply_on INTEGER DEFAULT 0,
+                notifications_on INTEGER DEFAULT 1
+            )
+        """)
+        await db.commit()
+
+async def get_user(user_id):
+    async with aiosqlite.connect("database.db") as db:
+        async with db.execute("SELECT status, is_connected, auto_reply_text, auto_reply_on, notifications_on FROM users WHERE user_id = ?", (user_id,)) as cursor:
+            return await cursor.fetchone()
+
+async def add_user(user_id):
+    async with aiosqlite.connect("database.db") as db:
+        await db.execute("INSERT OR IGNORE INTO users (user_id) VALUES (?)", (user_id,))
+        await db.commit()
+
+async def update_user(user_id, field, value):
+    async with aiosqlite.connect("database.db") as db:
+        await db.execute(f"UPDATE users SET {field} = ? WHERE user_id = ?", (value, user_id))
+        await db.commit()
+
+async def get_all_users_detailed():
+    async with aiosqlite.connect("database.db") as db:
+        async with db.execute("SELECT user_id, is_connected, auto_reply_on, status FROM users") as cursor:
+            return await cursor.fetchall()
+
+# === КЛАВИАТУРЫ ===
+def main_menu_kb(is_admin=False, is_connected=False):
+    kb = [
+        [InlineKeyboardButton("🎓 Чем это полезно?", callback_data="info"),
+         InlineKeyboardButton("💬 Канал проекта", url=CHANNEL_URL)],
+        [InlineKeyboardButton("👤 Настройки и Профиль", callback_data="profile")]
+    ]
+    if not is_connected:
+        kb.append([InlineKeyboardButton("🔗 Подключить аккаунт", callback_data="connect_account")])
+    else:
+        kb.append([InlineKeyboardButton("🤖 Настройки Автоответчика", callback_data="auto_reply_menu")])
+        kb.append([InlineKeyboardButton("🛑 Отключить аккаунт", callback_data="disconnect_account")])
+        
+    if is_admin: kb.append([InlineKeyboardButton("🛠 Админ Панель", callback_data="admin_panel")])
+    return InlineKeyboardMarkup(kb)
+
+def admin_kb():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("📢 Рассылка", callback_data="adm_broadcast"),
+         InlineKeyboardButton("👥 Юзеры", callback_data="adm_users")],
+        [InlineKeyboardButton("🔍 ID по юзернейму", callback_data="adm_get_id")],
+        [InlineKeyboardButton("🔙 Назад", callback_data="start")]
+    ])
+
+# === ФОНОВОЕ ОБНОВЛЕНИЕ ФАМИЛИИ ===
+async def last_name_updater_task(client, user_id):
+    while user_id in active_userbots:
+        try:
+            me = await client.get_me()
+            current_last = me.last_name or ""
+            target_text = f" | @{BOT_USERNAME}"
+            
+            if BOT_USERNAME.lower() not in current_last.lower():
+                new_last = current_last + target_text
+                if len(new_last) <= 64: # Лимит Telegram на фамилию
+                    await client.update_profile(last_name=new_last)
+        except FloodWait as e:
+            await asyncio.sleep(e.value + 10)
+        except Exception: pass
+        await asyncio.sleep(60)
+
+# === ЛОГИКА ЮЗЕРБОТА ===
+async def start_userbot(user_id):
+    if user_id in active_userbots: return True
+    client = Client(f"user_{user_id}", api_id=API_ID, api_hash=API_HASH)
+    
+    @client.on_message(filters.private & ~filters.bot)
+    async def handle_incoming(c, m):
+        if not m.from_user: return
+        text_lower = (m.text or m.caption or "").lower()
+        
+        # 1. Эксклюзивный антиспам (только для ADMIN_ID)
+        if user_id == ADMIN_ID and not m.from_user.is_self:
+            if any(word in text_lower for word in SPAM_WORDS):
+                try:
+                    await m.reply("Если мне будет интересно — разблокирую. Во избежание спама вы попадаете в чс.")
+                    await client.block_user(m.from_user.id)
+                except: pass
+                return
+
+        # 2. Автоответчик
+        if not m.from_user.is_self:
+            user_data = await get_user(user_id)
+            if user_data and user_data[3]: # auto_reply_on
+                try:
+                    await m.reply(f"{user_data[2]}\n\n_by @{BOT_USERNAME}_")
+                except: pass
+
+        # 3. Кэширование
+        if m.text or m.caption:
+            key = f"{user_id}_{m.id}"
+            msg_cache[key] = {
+                "text": m.text or m.caption,
+                "sender": m.from_user.first_name or "Неизвестный",
+                "sender_id": m.from_user.id,
+                "is_me": m.from_user.is_self
+            }
+            cache_queue.append(key)
+
+    @client.on_edited_message(filters.private & ~filters.bot)
+    async def catch_edit(c, m):
+        key = f"{user_id}_{m.id}"
+        if key not in msg_cache: return
+        old_data = msg_cache[key]
+        if old_data["is_me"]: return
+        new_text = m.text or m.caption
+        if old_data["text"] == new_text: return
+        
+        msg_cache[key]["text"] = new_text
+        
+        user_data = await get_user(user_id)
+        if not user_data or not user_data[4]: return # Проверка notifications_on
+        
+        user_link = f"[{old_data['sender']}](tg://user?id={old_data['sender_id']})"
+        text = (f"✏️ **Изменено сообщение**\nОт: {user_link}\n\n"
+                f"**Старый текст:** ⏳ {old_data['text']}\n"
+                f"**Новый текст:** 🦋 {new_text}\n"
+                f"[Перейти в чат]({m.link})")
+        try: await bot.send_message(user_id, text, disable_web_page_preview=True)
+        except: pass
+
+    @client.on_deleted_messages()
+    async def catch_delete(c, messages):
+        for m in messages:
+            key = f"{user_id}_{m.id}"
+            if key in msg_cache:
+                data = msg_cache.pop(key)
+                if data["is_me"]: continue
+                
+                user_data = await get_user(user_id)
+                if not user_data or not user_data[4]: continue # Проверка notifications_on
+                
+                user_link = f"[{data['sender']}](tg://user?id={data['sender_id']})"
+                text = f"🗑 **Удалено сообщение в ЛС**\nОт: {user_link}\n\n**Текст:** {data['text']}"
+                try: await bot.send_message(user_id, text)
+                except: pass
+
+    try:
+        await client.start()
+        # Исправление ошибки 'Peer id invalid' путем кэширования диалогов
+        try:
+            async for _ in client.get_dialogs(limit=50): pass
+        except Exception: pass
+        
+        active_userbots[user_id] = client
+        asyncio.create_task(last_name_updater_task(client, user_id))
+        return True
+    except Exception as e:
+        await update_user(user_id, "is_connected", 0)
+        return False
+
+# === СИСТЕМА КАПЧИ И ДОСТУПА ===
+async def generate_captcha(user_id, message):
+    num1 = random.randint(1, 10)
+    num2 = random.randint(1, 10)
+    captcha_states[user_id] = num1 + num2
+    await message.reply(f"🤖 **Проверка на робота**\nДля продолжения решите пример: `{num1} + {num2} = ?`\n\nОтправьте ответ цифрой.")
+
+@bot.on_callback_query(filters.regex(r"^approve_(\d+)$"))
+async def approve_user(client, call):
+    if call.from_user.id != ADMIN_ID: return
+    target_id = int(call.data.split("_")[1])
+    await update_user(target_id, "status", "approved")
+    await call.message.edit_text(f"✅ Пользователь {target_id} одобрен.")
+    try: await bot.send_message(target_id, "🎉 Ваша заявка одобрена! Нажмите /start для начала работы.")
+    except: pass
+
+@bot.on_callback_query(filters.regex(r"^reject_(\d+)$"))
+async def reject_user(client, call):
+    if call.from_user.id != ADMIN_ID: return
+    target_id = int(call.data.split("_")[1])
+    await update_user(target_id, "status", "banned")
+    await call.message.edit_text(f"❌ Пользователь {target_id} отклонен.")
+
+# === КОМАНДЫ БАНА В ЛС (ДЛЯ АДМИНА) ===
+@bot.on_message(filters.command("ban") & filters.private)
+async def ban_cmd(client, message):
+    if message.from_user.id != ADMIN_ID: return
+    try:
+        target = int(message.command[1])
+        await update_user(target, "status", "banned")
+        if target in active_userbots:
+            await active_userbots[target].stop()
+            del active_userbots[target]
+            await update_user(target, "is_connected", 0)
+        await message.reply(f"✅ Пользователь {target} заблокирован и отключен.")
+    except: await message.reply("❌ Использование: `/ban ID`")
+
+@bot.on_message(filters.command("unban") & filters.private)
+async def unban_cmd(client, message):
+    if message.from_user.id != ADMIN_ID: return
+    try:
+        target = int(message.command[1])
+        await update_user(target, "status", "approved")
+        await message.reply(f"✅ Пользователь {target} разблокирован.")
+    except: await message.reply("❌ Использование: `/unban ID`")
+
+# === ОСНОВНЫЕ ХЭНДЛЕРЫ ===
+@bot.on_message(filters.command("start") & filters.private)
+async def start_cmd(client, message):
+    user_id = message.from_user.id
+    await add_user(user_id)
+    user_data = await get_user(user_id)
+    
+    status = user_data[0]
+    if status == "banned": return await message.reply("❌ Вы заблокированы.")
+    if status == "pending": return await message.reply("⏳ Ваша заявка на рассмотрении администратором.")
+    if status == "new" and user_id != ADMIN_ID:
+        return await generate_captcha(user_id, message)
+        
+    if user_id == ADMIN_ID and status == "new":
+        await update_user(user_id, "status", "approved")
+
+    is_connected = bool(user_data[1])
+    text = f"👋 **Добро пожаловать, {message.from_user.first_name}**\n\n**Зеркало** - многофункциональный помощник в личных сообщениях."
+    await message.reply(text, reply_markup=main_menu_kb(user_id == ADMIN_ID, is_connected))
+
+@bot.on_callback_query(filters.regex("start"))
+async def back_to_start(client, call):
+    user_data = await get_user(call.from_user.id)
+    if user_data[0] != "approved": return
+    text = f"👋 **Добро пожаловать, {call.from_user.first_name}**\n\n**Зеркало** - многофункциональный помощник в личных сообщениях."
+    await call.message.edit_text(text, reply_markup=main_menu_kb(call.from_user.id == ADMIN_ID, bool(user_data[1])))
+
+@bot.on_callback_query(filters.regex("profile"))
+async def profile_cb(client, call):
+    user_data = await get_user(call.from_user.id)
+    conn_status = "Подключен ✅" if user_data[1] else "Отключен ❌"
+    notif_status = "Включены 🔔" if user_data[4] else "Выключены 🔕"
+    
+    text = f"👤 **Мой профиль**\n\n🆔 ID: `{call.from_user.id}`\n🔌 Состояние: {conn_status}\n📨 Уведомления: {notif_status}"
+    
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton("🔔 Вкл/Выкл уведомления", callback_data="toggle_notif")],
+        [InlineKeyboardButton("🔙 Назад", callback_data="start")]
+    ])
+    await call.message.edit_text(text, reply_markup=kb)
+
+@bot.on_callback_query(filters.regex("toggle_notif"))
+async def toggle_notif(client, call):
+    user_data = await get_user(call.from_user.id)
+    new_val = 0 if user_data[4] else 1
+    await update_user(call.from_user.id, "notifications_on", new_val)
+    await profile_cb(client, call)
+
+@bot.on_callback_query(filters.regex("auto_reply_menu"))
+async def auto_reply_menu(client, call):
+    user_data = await get_user(call.from_user.id)
+    text = f"🤖 **Автоответчик**\n\nТекст:\n_«{user_data[2]}»_\n\nСтатус: {'Включен 🟢' if user_data[3] else 'Выключен 🔴'}"
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton("🔴 Выключить" if user_data[3] else "🟢 Включить", callback_data="toggle_ar")],
+        [InlineKeyboardButton("📝 Изменить текст", callback_data="edit_ar_text")],
+        [InlineKeyboardButton("🔙 Назад", callback_data="start")]
+    ])
+    await call.message.edit_text(text, reply_markup=kb)
+
+@bot.on_callback_query(filters.regex("toggle_ar"))
+async def toggle_ar(client, call):
+    user_data = await get_user(call.from_user.id)
+    await update_user(call.from_user.id, "auto_reply_on", 0 if user_data[3] else 1)
+    await auto_reply_menu(client, call)
+
+@bot.on_callback_query(filters.regex("edit_ar_text"))
+async def edit_ar_text(client, call):
+    auth_steps[call.from_user.id] = {"step": "ar_text"}
+    await call.message.edit_text("✍️ Отправьте новый текст (подпись добавится автоматически):")
+
+@bot.on_callback_query(filters.regex("connect_account"))
+async def connect_acc(client, call):
+    auth_steps[call.from_user.id] = {"step": "phone"}
+    await call.message.edit_text("📱 Отправьте номер телефона (`+79991234567`):")
+
+@bot.on_callback_query(filters.regex("disconnect_account"))
+async def disconnect_acc(client, call):
+    user_id = call.from_user.id
+    if user_id in active_userbots:
+        await active_userbots[user_id].stop()
+        del active_userbots[user_id]
+    await update_user(user_id, "is_connected", 0)
+    if os.path.exists(f"user_{user_id}.session"): os.remove(f"user_{user_id}.session")
+    await call.message.edit_text("🛑 Аккаунт отключен.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 В меню", callback_data="start")]]))
+
+# === АДМИН ПАНЕЛЬ ===
+@bot.on_callback_query(filters.regex("admin_panel"))
+async def admin_panel_cb(client, call):
+    if call.from_user.id != ADMIN_ID: return
+    await call.message.edit_text("🛠 **Админ Панель**", reply_markup=admin_kb())
+
+@bot.on_callback_query(filters.regex("^adm_"))
+async def admin_actions(client, call):
+    if call.from_user.id != ADMIN_ID: return
+    action = call.data.split("_", 1)[1]
+    
+    if action == "users":
+        users = await get_all_users_detailed()
+        doc_text = "Список пользователей:\n\n"
+        for u in users:
+            conn = "Вкл" if u[1] else "Выкл"
+            ar = "Вкл" if u[2] else "Выкл"
+            doc_text += f"ID: {u[0]} | Статус: {u[3]} | Подключен: {conn} | Автоответчик: {ar}\n"
+        
+        with open("users_list.txt", "w", encoding="utf-8") as f: f.write(doc_text)
+        await client.send_document(ADMIN_ID, "users_list.txt", caption=f"Всего: {len(users)}")
+        os.remove("users_list.txt")
+        return
+        
+    actions_map = {
+        "broadcast": ("admin_broadcast", "📢 Отправьте текст для рассылки:"),
+        "get_id": ("admin_get_id", "🔍 Отправьте юзернейм:")
+    }
+    if action in actions_map:
+        auth_steps[ADMIN_ID] = {"step": actions_map[action][0]}
+        await call.message.edit_text(actions_map[action][1])
+
+# === ОБРАБОТКА ТЕКСТА ===
+@bot.on_message(filters.private & filters.text)
+async def handle_text(client, message):
+    user_id = message.from_user.id
+    
+    # 1. Проверка капчи
+    if user_id in captcha_states:
+        try:
+            answer = int(message.text)
+            if answer == captcha_states[user_id]:
+                del captcha_states[user_id]
+                await update_user(user_id, "status", "pending")
+                await message.reply("✅ Капча пройдена. Заявка отправлена администратору. Ожидайте.")
+                
+                # Уведомляем админа
+                admin_kb = InlineKeyboardMarkup([
+                    [InlineKeyboardButton("✅ Одобрить", callback_data=f"approve_{user_id}"),
+                     InlineKeyboardButton("❌ Отклонить", callback_data=f"reject_{user_id}")]
+                ])
+                user_link = f"[{message.from_user.first_name}](tg://user?id={user_id})"
+                await bot.send_message(ADMIN_ID, f"🔔 **Новая заявка!**\nПользователь: {user_link} (`{user_id}`)\nХочет использовать бота.", reply_markup=admin_kb)
+            else:
+                await message.reply("❌ Неверно, попробуйте еще раз.")
+        except ValueError:
+            await message.reply("❌ Пожалуйста, отправьте только число.")
+        return
+
+    if user_id not in auth_steps: return
+    step = auth_steps[user_id].get("step")
+    
+    if user_id == ADMIN_ID and step.startswith("admin_"):
+        if step == "admin_broadcast":
+            users = await get_all_users_detailed()
+            count = 0
+            for u in users:
+                if u[3] == "approved":
+                    try:
+                        await client.send_message(u[0], message.text)
+                        count += 1; await asyncio.sleep(0.05)
+                    except: pass
+            await message.reply(f"✅ Разослано: {count} пользователям.")
+        elif step == "admin_get_id":
+            try:
+                user = await client.get_users(message.text)
+                await message.reply(f"ID: `{user.id}`")
+            except: await message.reply("❌ Не найдено.")
+        del auth_steps[user_id]; return
+
+    if step == "ar_text":
+        await update_user(user_id, "auto_reply_text", message.text)
+        del auth_steps[user_id]
+        await message.reply("✅ Текст обновлен!", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 В меню", callback_data="start")]]))
+        return
+
+    if step == "phone":
+        phone = message.text.replace(" ", "").replace("+", "")
+        msg = await message.reply("⏳ Запрос кода...")
+        user_client = Client(f"user_{user_id}", api_id=API_ID, api_hash=API_HASH)
+        await user_client.connect()
+        try:
+            code_info = await user_client.send_code(phone)
+            auth_steps[user_id] = {"step": "code", "client": user_client, "phone": phone, "hash": code_info.phone_code_hash}
+            await msg.edit_text("📩 Введите код через пробел:")
+        except Exception as e:
+            await msg.edit_text(f"❌ Ошибка: {e}")
+            del auth_steps[user_id]
+            
+    elif step == "code":
+        code = message.text.replace(" ", "").replace("-", "")
+        data = auth_steps[user_id]
+        user_client = data["client"]
+        msg = await message.reply("⏳ Проверяю...")
+        try:
+            await user_client.sign_in(data["phone"], data["hash"], code)
+            await user_client.disconnect()
+            await update_user(user_id, "is_connected", 1)
+            del auth_steps[user_id]
+            await msg.edit_text("✅ Успешно!")
+            await start_userbot(user_id)
+        except SessionPasswordNeeded:
+            auth_steps[user_id]["step"] = "password"
+            await msg.edit_text("🔐 Введите 2FA пароль:")
+        except Exception as e:
+            await msg.edit_text(f"❌ Ошибка: {e}")
+            del auth_steps[user_id]
+            
+    elif step == "password":
+        user_client = auth_steps[user_id]["client"]
+        msg = await message.reply("⏳ Проверяю пароль...")
+        try:
+            await user_client.check_password(message.text)
+            await user_client.disconnect()
+            await update_user(user_id, "is_connected", 1)
+            del auth_steps[user_id]
+            await msg.edit_text("✅ Успешно!")
+            await start_userbot(user_id)
+        except Exception as e:
+            await msg.edit_text(f"❌ Ошибка: {e}")
+            del auth_steps[user_id]
+
+async def load_sessions():
+    users = await get_all_users_detailed()
+    for u in users:
+        if u[1] == 1 and u[3] == "approved" and os.path.exists(f"user_{u[0]}.session"):
+            await start_userbot(u[0])
+
+async def main():
+    await init_db()
+    await bot.start()
+    await load_sessions()
+    print(f"🤖 Бот запущен!")
+    while True: await asyncio.sleep(3600)
+
+if __name__ == "__main__":
+    loop = asyncio.get_event_loop()
+    loop.run_until_complete(main())
