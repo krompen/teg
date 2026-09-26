@@ -1,0 +1,770 @@
+import asyncio
+import sqlite3
+import logging
+import re
+import time
+import io
+from datetime import datetime
+from aiogram import Bot, Dispatcher, F
+from aiogram.filters import CommandStart, Command, BaseFilter
+from aiogram.types import (Message, CallbackQuery, ReplyKeyboardMarkup, KeyboardButton, 
+                           InlineKeyboardMarkup, InlineKeyboardButton, BufferedInputFile)
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
+from aiogram.fsm.storage.memory import MemoryStorage
+from aiogram.client.default import DefaultBotProperties
+from aiogram.enums import ParseMode
+from aiogram.exceptions import TelegramAPIError
+
+# --- КОНСТАНТЫ ---
+TOKEN = "8707563740:AAHL3QOACGolWpKeXn4MPIuic-NxIr2oPW4"
+ADMIN_ID = 8724732477
+DB_FILE = "bot_database.sqlite"
+PROMO_LIMIT = 10
+MAIN_BOT_USERNAME = "" 
+
+# Глобальный словарь для управления процессами запущенных ботов
+running_child_bots = {}
+
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
+
+# ==================== БАЗА ДАННЫХ ====================
+
+def init_db():
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    # Создаем таблицы
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS users (
+            id INTEGER PRIMARY KEY,
+            username TEXT,
+            full_name TEXT,
+            is_banned INTEGER DEFAULT 0,
+            premium INTEGER DEFAULT 0,
+            premium_expires INTEGER DEFAULT 0,
+            registered_at INTEGER
+        )
+    ''')
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS child_bots (
+            owner_id INTEGER PRIMARY KEY,
+            bot_token TEXT UNIQUE,
+            bio TEXT DEFAULT 'Информация отсутствует.',
+            working_hours TEXT DEFAULT 'Не указаны',
+            spam_filter INTEGER DEFAULT 0
+        )
+    ''')
+    
+    # Безопасная миграция базы данных (добавление новых колонок без потери данных)
+    columns = [col[1] for col in c.execute("PRAGMA table_info(users)").fetchall()]
+    if 'premium_expires' not in columns:
+        c.execute("ALTER TABLE users ADD COLUMN premium_expires INTEGER DEFAULT 0")
+    if 'registered_at' not in columns:
+        c.execute("ALTER TABLE users ADD COLUMN registered_at INTEGER DEFAULT 0")
+        
+    cb_columns = [col[1] for col in c.execute("PRAGMA table_info(child_bots)").fetchall()]
+    if 'bio' not in cb_columns: c.execute("ALTER TABLE child_bots ADD COLUMN bio TEXT DEFAULT 'Информация отсутствует.'")
+    if 'working_hours' not in cb_columns: c.execute("ALTER TABLE child_bots ADD COLUMN working_hours TEXT DEFAULT 'Не указаны'")
+    if 'spam_filter' not in cb_columns: c.execute("ALTER TABLE child_bots ADD COLUMN spam_filter INTEGER DEFAULT 0")
+    
+    conn.commit()
+    conn.close()
+
+def db_add_user(user_id, username, full_name):
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute("SELECT id FROM users WHERE id=?", (user_id,))
+    if not c.fetchone():
+        now = int(time.time())
+        c.execute("INSERT INTO users (id, username, full_name, is_banned, premium, premium_expires, registered_at) VALUES (?, ?, ?, 0, 0, 0, ?)", 
+                  (user_id, username, full_name, now))
+        is_new = True
+    else:
+        c.execute("UPDATE users SET username=?, full_name=? WHERE id=?", (username, full_name, user_id))
+        is_new = False
+    conn.commit()
+    conn.close()
+    return is_new
+
+def db_get_user(user_id):
+    conn = sqlite3.connect(DB_FILE)
+    conn.row_factory = sqlite3.Row
+    c = conn.cursor()
+    c.execute("SELECT * FROM users WHERE id=?", (user_id,))
+    user = c.fetchone()
+    conn.close()
+    return user
+
+def db_get_all_users():
+    conn = sqlite3.connect(DB_FILE)
+    conn.row_factory = sqlite3.Row
+    c = conn.cursor()
+    c.execute("SELECT * FROM users")
+    users = c.fetchall()
+    conn.close()
+    return users
+
+def is_user_premium(db_user):
+    if not db_user: return False
+    if db_user['premium'] == 1:
+        if db_user['premium_expires'] == 0:
+            return True # Навсегда
+        elif db_user['premium_expires'] > int(time.time()):
+            return True # Еще действует
+        else:
+            # Время вышло, убираем прем
+            db_set_status(db_user['id'], "premium", 0)
+            db_set_status(db_user['id'], "premium_expires", 0)
+            return False
+    return False
+
+def db_apply_promo_if_available(user_id):
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute("SELECT COUNT(*) FROM users WHERE premium=1 AND premium_expires=0")
+    count = c.fetchone()[0]
+    if count < PROMO_LIMIT:
+        c.execute("UPDATE users SET premium=1, premium_expires=0 WHERE id=?", (user_id,))
+        conn.commit()
+        conn.close()
+        return True
+    conn.close()
+    return False
+
+def db_set_status(user_id, field, value):
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute(f"UPDATE users SET {field}=? WHERE id=?", (value, user_id))
+    conn.commit()
+    conn.close()
+
+def db_set_premium(user_id, expires_at):
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute("UPDATE users SET premium=1, premium_expires=? WHERE id=?", (expires_at, user_id))
+    conn.commit()
+    conn.close()
+
+def db_add_child_bot(owner_id, token):
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    try:
+        c.execute("INSERT INTO child_bots (owner_id, bot_token) VALUES (?, ?)", (owner_id, token))
+        conn.commit()
+        success = True
+    except sqlite3.IntegrityError:
+        success = False
+    conn.close()
+    return success
+
+def db_get_child_bot(owner_id):
+    conn = sqlite3.connect(DB_FILE)
+    conn.row_factory = sqlite3.Row
+    c = conn.cursor()
+    c.execute("SELECT * FROM child_bots WHERE owner_id=?", (owner_id,))
+    bot = c.fetchone()
+    conn.close()
+    return bot
+
+def db_get_all_bots():
+    conn = sqlite3.connect(DB_FILE)
+    conn.row_factory = sqlite3.Row
+    c = conn.cursor()
+    c.execute("SELECT * FROM child_bots")
+    bots = c.fetchall()
+    conn.close()
+    return bots
+
+def db_update_child_bot(owner_id, field, value):
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute(f"UPDATE child_bots SET {field}=? WHERE owner_id=?", (value, owner_id))
+    conn.commit()
+    conn.close()
+
+def db_delete_child_bot(owner_id):
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute("DELETE FROM child_bots WHERE owner_id=?", (owner_id,))
+    conn.commit()
+    conn.close()
+
+
+# ==================== НАСТРОЙКИ БОТА ====================
+
+bot = Bot(token=TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
+dp = Dispatcher(storage=MemoryStorage())
+
+class IsAdmin(BaseFilter):
+    async def __call__(self, message: Message) -> bool:
+        return message.from_user.id == ADMIN_ID
+
+class ContactAdmin(StatesGroup):
+    choosing_category = State()
+    writing_message = State()
+
+class AdminActions(StatesGroup):
+    target_user_id = State()
+    action_type = State()
+    premium_duration = State()
+    writing_broadcast = State()
+
+class CreateBotFSM(StatesGroup):
+    waiting_for_token = State()
+
+class BotSettingsFSM(StatesGroup):
+    waiting_for_bio = State()
+    waiting_for_hours = State()
+
+class ChildBotStates(StatesGroup):
+    choosing_category = State()
+    writing_message = State()
+
+# ==================== КЛАВИАТУРЫ ====================
+
+def get_main_kb(user_id: int):
+    kb = [
+        [KeyboardButton(text="👤 Мой профиль"), KeyboardButton(text="✉️ Связаться")],
+        [KeyboardButton(text="🤖 Мой бот"), KeyboardButton(text="💎 Premium")]
+    ]
+    if user_id == ADMIN_ID: kb.append([KeyboardButton(text="⚙️ Админ-панель")])
+    return ReplyKeyboardMarkup(keyboard=kb, resize_keyboard=True)
+
+def get_categories_kb(prefix="cat_"):
+    kb = [
+        [InlineKeyboardButton(text="❓ Вопрос", callback_data=f"{prefix}question"), 
+         InlineKeyboardButton(text="⚠️ Проблема", callback_data=f"{prefix}problem")],
+        [InlineKeyboardButton(text="🤝 Сотрудничество", callback_data=f"{prefix}collab"),
+         InlineKeyboardButton(text="💡 Идея", callback_data=f"{prefix}idea")],
+        [InlineKeyboardButton(text="❌ Отмена", callback_data=f"{prefix}cancel")]
+    ]
+    return InlineKeyboardMarkup(inline_keyboard=kb)
+
+def get_admin_kb():
+    kb = [
+        [KeyboardButton(text="📋 Инфо о пользователе"), KeyboardButton(text="📊 Детальный отчет (TXT)")],
+        [KeyboardButton(text="🚫 Бан"), KeyboardButton(text="✅ Разбан")],
+        [KeyboardButton(text="🎁 Выдать Premium"), KeyboardButton(text="💔 Забрать Premium")],
+        [KeyboardButton(text="📢 Рассылка"), KeyboardButton(text="🔙 В главное меню")]
+    ]
+    return ReplyKeyboardMarkup(keyboard=kb, resize_keyboard=True)
+
+def get_bot_manage_kb(is_premium: bool):
+    kb = [
+        [InlineKeyboardButton(text="📝 Изменить Bio" + ("" if is_premium else " 🔒 (Premium)"), callback_data="set_bio")],
+        [InlineKeyboardButton(text="🕒 Часы работы" + ("" if is_premium else " 🔒 (Premium)"), callback_data="set_hours")],
+        [InlineKeyboardButton(text="🛡 Антиспам фильтр" + ("" if is_premium else " 🔒 (Premium)"), callback_data="toggle_spam")],
+        [InlineKeyboardButton(text="🗑 Удалить и остановить бота", callback_data="delete_bot")]
+    ]
+    return InlineKeyboardMarkup(inline_keyboard=kb)
+
+def get_premium_durations_kb():
+    kb = [
+        [InlineKeyboardButton(text="1 День", callback_data="prem_86400"), InlineKeyboardButton(text="1 Неделя", callback_data="prem_604800")],
+        [InlineKeyboardButton(text="1 Месяц", callback_data="prem_2592000"), InlineKeyboardButton(text="Навсегда", callback_data="prem_0")]
+    ]
+    return InlineKeyboardMarkup(inline_keyboard=kb)
+
+# ==================== ГЛАВНЫЙ БОТ ====================
+
+@dp.message(CommandStart())
+async def cmd_start(message: Message, state: FSMContext):
+    await state.clear()
+    user = message.from_user
+    is_new = db_add_user(user.id, user.username, user.full_name)
+    
+    db_user = db_get_user(user.id)
+    if db_user and db_user['is_banned'] == 1:
+        return await message.answer("🚫 <b>Доступ ограничен.</b> Ваш аккаунт заблокирован.")
+
+    text = (f"👋 <b>Добро пожаловать, {user.full_name}!</b>\n\n"
+            f"Я — платформа для создания идеальных ботов обратной связи. "
+            f"Создайте своего <b>личного бота</b> в пару кликов и принимайте сообщения от клиентов "
+            f"без раскрытия своего личного аккаунта.")
+    await message.answer(text, reply_markup=get_main_kb(user.id))
+
+    if is_new:
+        if db_apply_promo_if_available(user.id):
+            await message.answer("🎉 <b>СУПЕР-АКЦИЯ!</b> Вы попали в число первых 10-ти пользователей и <b>автоматически получили Premium навсегда!</b> 🎁\n\nПроверьте раздел «💎 Premium».")
+
+@dp.message(F.text == "👤 Мой профиль")
+async def show_profile(message: Message):
+    db_user = db_get_user(message.from_user.id)
+    if not db_user or db_user['is_banned'] == 1: return
+    
+    username = f"@{db_user['username']}" if db_user['username'] else "Отсутствует"
+    is_prem = is_user_premium(db_user)
+    
+    prem_status = "❌ Нет"
+    if is_prem:
+        if db_user['premium_expires'] == 0: prem_status = "🌟 АКТИВЕН (Навсегда)"
+        else:
+            exp_date = datetime.fromtimestamp(db_user['premium_expires']).strftime('%d.%m.%Y %H:%M')
+            prem_status = f"🌟 АКТИВЕН (до {exp_date})"
+    
+    text = (f"👤 <b>Ваш профиль:</b>\n\n"
+            f"<b>Имя:</b> {db_user['full_name']}\n"
+            f"<b>Юзернейм:</b> {username}\n"
+            f"<b>Ваш ID:</b> <code>{db_user['id']}</code>\n\n"
+            f"👑 <b>Premium статус:</b> {prem_status}")
+    await message.answer(text)
+
+@dp.message(F.text == "💎 Premium")
+async def show_premium(message: Message):
+    db_user = db_get_user(message.from_user.id)
+    is_prem = is_user_premium(db_user)
+    
+    status_text = "✅ <b>У вас уже есть активный Premium!</b>" if is_prem else "❌ <b>Premium не активен.</b>"
+    
+    text = (f"💎 <b>Premium-подписка — мощь для вашего бизнеса!</b>\n\n"
+            f"<b>🔥 Что дает Premium ВАШЕМУ боту:</b>\n"
+            f"1️⃣ <b>Полный White-label:</b> Отсутствие надписи «Создано с помощью...». Клиенты думают, что вы заказали разработку с нуля.\n"
+            f"2️⃣ <b>Витрина (Bio):</b> Укажите информацию о себе (что продаете, покупаете, прайс услуг).\n"
+            f"3️⃣ <b>График работы:</b> Клиенты видят ваши часы работы при нажатии кнопки «Инфо».\n"
+            f"4️⃣ <b>Умный Антиспам:</b> Бот будет блокировать глупые, короткие сообщения (<15 символов).\n\n"
+            f"{status_text}\n\n"
+            f"<i>За приобретением обращайтесь к администратору: @sb_teh_robot</i>")
+    
+    kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🛒 Купить Premium", url="http://t.me/sb_teh_robot")]])
+    await message.answer(text, reply_markup=kb if not is_prem else None)
+
+@dp.message(F.text == "🤖 Мой бот")
+async def manage_bot_cmd(message: Message, state: FSMContext):
+    user_id = message.from_user.id
+    db_user = db_get_user(user_id)
+    if not db_user or db_user['is_banned'] == 1: return
+    is_prem = is_user_premium(db_user)
+    
+    child_bot = db_get_child_bot(user_id)
+    if not child_bot:
+        text = ("🤖 <b>Создание вашего бота</b>\n\n"
+                "Инструкция по запуску:\n"
+                "1. Перейдите в официального @BotFather.\n"
+                "2. Создайте нового бота (команда <code>/newbot</code>).\n"
+                "3. Скопируйте выданный вам <b>HTTP API Token</b>.\n"
+                "4. Отправьте этот токен прямо сюда в чат.\n\n"
+                "<i>⚠️ Без Premium ваш бот будет иметь базовый функционал и водяной знак нашей платформы.</i>\n\n"
+                "Пришлите токен или напишите /cancel для отмены.")
+        await message.answer(text)
+        await state.set_state(CreateBotFSM.waiting_for_token)
+    else:
+        spam_status = "✅ Включен" if child_bot['spam_filter'] == 1 else "❌ Выключен"
+        bot_status = "🟢 Запущен" if user_id in running_child_bots else "🔴 Остановлен"
+        text = (f"🤖 <b>Управление вашим ботом</b>\n"
+                f"Статус процесса: {bot_status}\n\n"
+                f"<b>Ваше Bio:</b> {child_bot['bio']}\n"
+                f"<b>Часы работы:</b> {child_bot['working_hours']}\n"
+                f"<b>Антиспам фильтр:</b> {spam_status}\n\n"
+                f"<i>⚙️ Выберите действие:</i>")
+        await message.answer(text, reply_markup=get_bot_manage_kb(is_prem))
+
+@dp.message(CreateBotFSM.waiting_for_token)
+async def process_new_bot_token(message: Message, state: FSMContext):
+    token = message.text.strip()
+    if token == "/cancel":
+        await state.clear()
+        return await message.answer("❌ Отменено.", reply_markup=get_main_kb(message.from_user.id))
+
+    if not re.match(r"^\d{8,10}:[a-zA-Z0-9_-]{35}$", token):
+        return await message.answer("❌ <b>Неверный формат токена.</b> Убедитесь, что скопировали его полностью. Попробуйте еще раз или /cancel")
+        
+    m = await message.answer("⏳ Проверяем токен и поднимаем сервер...")
+    if db_add_child_bot(message.from_user.id, token):
+        # Попытка запустить бота
+        task = asyncio.create_task(launch_child_bot(token, message.from_user.id))
+        running_child_bots[message.from_user.id] = task
+        
+        await asyncio.sleep(1) # Ждем, чтобы отловить быструю ошибку неверного токена
+        if task.done() and task.exception():
+             db_delete_child_bot(message.from_user.id)
+             del running_child_bots[message.from_user.id]
+             return await m.edit_text("❌ Ошибка запуска. Токен недействителен или заблокирован.")
+
+        await m.edit_text("✅ <b>Ваш бот успешно запущен и работает в фоновом режиме!</b>\nПерейдите в него и нажмите /start.", reply_markup=get_main_kb(message.from_user.id))
+    else:
+        await m.edit_text("❌ У вас уже есть бот, либо этот токен привязан к другому аккаунту.")
+    await state.clear()
+
+@dp.callback_query(F.data.in_(["set_bio", "set_hours", "toggle_spam", "delete_bot"]))
+async def bot_settings_handler(call: CallbackQuery, state: FSMContext):
+    user_id = call.from_user.id
+    db_user = db_get_user(user_id)
+    is_prem = is_user_premium(db_user)
+    action = call.data
+
+    if action == "delete_bot":
+        db_delete_child_bot(user_id)
+        # Горячая остановка процесса
+        if user_id in running_child_bots:
+            running_child_bots[user_id].cancel()
+            del running_child_bots[user_id]
+        return await call.message.edit_text("✅ Ваш бот полностью удален из базы и <b>остановлен</b>.")
+
+    if not is_prem:
+        return await call.answer("💎 Эта функция доступна только с Premium!", show_alert=True)
+
+    if action == "set_bio":
+        await call.message.answer("✏️ <b>Отправьте новую информацию о себе (Bio):</b>\nРасскажите клиентам, что вы предлагаете, ваши прайсы или правила.")
+        await state.set_state(BotSettingsFSM.waiting_for_bio)
+    elif action == "set_hours":
+        await call.message.answer("🕒 <b>Отправьте ваши часы работы:</b>\nНапример: Пн-Пт 10:00-20:00, Сб-Вс Выходной")
+        await state.set_state(BotSettingsFSM.waiting_for_hours)
+    elif action == "toggle_spam":
+        bot_data = db_get_child_bot(user_id)
+        new_val = 0 if bot_data['spam_filter'] == 1 else 1
+        db_update_child_bot(user_id, "spam_filter", new_val)
+        await call.message.edit_text(f"✅ Умный антиспам-фильтр {'включен 🟢' if new_val else 'выключен 🔴'}.")
+    await call.answer()
+
+@dp.message(BotSettingsFSM.waiting_for_bio)
+async def update_bio(message: Message, state: FSMContext):
+    db_update_child_bot(message.from_user.id, "bio", message.text[:800])
+    await message.answer("✅ Информация успешно обновлена! Пользователи увидят её в разделе Инфо.")
+    await state.clear()
+
+@dp.message(BotSettingsFSM.waiting_for_hours)
+async def update_hours(message: Message, state: FSMContext):
+    db_update_child_bot(message.from_user.id, "working_hours", message.text[:200])
+    await message.answer("✅ Часы работы обновлены!")
+    await state.clear()
+
+@dp.message(F.text == "✉️ Связаться")
+async def start_contact_main(message: Message, state: FSMContext):
+    db_user = db_get_user(message.from_user.id)
+    if not db_user or db_user['is_banned'] == 1: return
+    await message.answer("Выберите причину вашего обращения к администрации платформы:", reply_markup=get_categories_kb())
+    await state.set_state(ContactAdmin.choosing_category)
+
+@dp.callback_query(F.data.startswith("cat_"), ContactAdmin.choosing_category)
+async def category_chosen_main(call: CallbackQuery, state: FSMContext):
+    if call.data == "cat_cancel":
+        await state.clear()
+        return await call.message.edit_text("❌ Обращение отменено.")
+    cats = {"cat_question": "❓ Вопрос", "cat_problem": "⚠️ Техническая проблема", "cat_collab": "🤝 Сотрудничество / Разработка", "cat_idea": "💡 Предложение идеи"}
+    cat = cats.get(call.data, "Другое")
+    await state.update_data(category=cat)
+    await call.message.edit_text(f"Категория: <b>{cat}</b>\n\n✏️ Опишите суть сообщения. Мы ответим вам прямо в этом боте.")
+    await state.set_state(ContactAdmin.writing_message)
+
+@dp.message(ContactAdmin.writing_message)
+async def receive_contact_main(message: Message, state: FSMContext):
+    data = await state.get_data()
+    user = message.from_user
+    username = f"@{user.username}" if user.username else "Скрыт"
+    text = (f"🔔 <b>Обращение в Поддержку</b>\n"
+            f"<b>Категория:</b> {data.get('category')}\n"
+            f"<b>Пользователь:</b> {user.full_name} ({username})\n"
+            f"<b>ID:</b> <code>{user.id}</code>\n\n"
+            f"{message.text}\n\n"
+            f"<i>Для ответа используй:</i> <code>/reply {user.id} текст</code>")
+    try:
+        await bot.send_message(ADMIN_ID, text)
+        await message.answer("✅ Ваше сообщение успешно доставлено! Ожидайте ответа.")
+    except Exception as e:
+        await message.answer("❌ Ошибка доставки сообщения.")
+        logger.error(f"Error sending message to admin: {e}")
+    await state.clear()
+
+
+# ==================== АДМИН ПАНЕЛЬ ====================
+
+@dp.message(F.text == "⚙️ Админ-панель", IsAdmin())
+async def admin_panel_start(message: Message, state: FSMContext):
+    await state.clear()
+    await message.answer("🔐 <b>Панель управления платформой</b>\n\nВыбери действие:", reply_markup=get_admin_kb())
+
+@dp.message(F.text == "🔙 В главное меню")
+async def back_to_main(message: Message, state: FSMContext):
+    await state.clear()
+    await message.answer("Вы вернулись в меню пользователя.", reply_markup=get_main_kb(message.from_user.id))
+
+@dp.message(Command("reply"), IsAdmin())
+async def main_bot_reply(message: Message):
+    args = message.text.split(maxsplit=2)
+    if len(args) < 3: return await message.answer("ℹ️ Использование: <code>/reply [ID_пользователя] [Ваш текст]</code>")
+    try:
+        await bot.send_message(int(args[1]), f"📩 <b>Официальный ответ администрации:</b>\n\n{args[2]}")
+        await message.answer("✅ Ответ успешно отправлен!")
+    except Exception as e:
+        await message.answer(f"❌ Не удалось отправить (Возможно, юзер заблокировал бота).\nОшибка: {e}")
+
+@dp.message(F.text == "📊 Детальный отчет (TXT)", IsAdmin())
+async def send_detailed_report(message: Message):
+    m = await message.answer("⏳ Собираю данные базы...")
+    users = db_get_all_users()
+    bots = db_get_all_bots()
+    
+    report = f"==== ОТЧЕТ О ПЛАТФОРМЕ ====\n"
+    report += f"Сгенерирован: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
+    report += f"📈 ОБЩАЯ СТАТИСТИКА:\n"
+    report += f"- Всего пользователей: {len(users)}\n"
+    report += f"- Активных зеркал (ботов): {len(bots)}\n"
+    report += f"- Premium пользователей: {sum(1 for u in users if is_user_premium(u))}\n"
+    report += f"- Забаненных: {sum(1 for u in users if u['is_banned'] == 1)}\n\n"
+    
+    report += f"👥 ДЕТАЛИЗАЦИЯ ПОЛЬЗОВАТЕЛЕЙ:\n"
+    for u in users:
+        prem = "Нет"
+        if is_user_premium(u):
+            prem = "Навсегда" if u['premium_expires'] == 0 else f"До {datetime.fromtimestamp(u['premium_expires']).strftime('%d.%m.%Y')}"
+        banned = "ДА" if u['is_banned'] == 1 else "Нет"
+        reg = datetime.fromtimestamp(u['registered_at']).strftime('%d.%m.%Y') if u['registered_at'] else "Неизвестно"
+        
+        report += f"ID: {u['id']} | @{u['username']} | Имя: {u['full_name']}\n"
+        report += f"   Рег: {reg} | Бан: {banned} | Premium: {prem}\n"
+        
+    file_bytes = report.encode('utf-8')
+    file = BufferedInputFile(file_bytes, filename=f"Report_{datetime.now().strftime('%Y%m%d')}.txt")
+    await m.delete()
+    await message.answer_document(file, caption="✅ Детальный отчет готов.")
+
+@dp.message(F.text == "📢 Рассылка", IsAdmin())
+async def start_broadcast(message: Message, state: FSMContext):
+    await message.answer("Отправьте сообщение (текст, фото или видео), которое нужно разослать всем пользователям платформы.\n\nДля отмены напишите /cancel.")
+    await state.set_state(AdminActions.writing_broadcast)
+
+@dp.message(AdminActions.writing_broadcast, IsAdmin())
+async def process_broadcast(message: Message, state: FSMContext):
+    if message.text == "/cancel":
+        await state.clear()
+        return await message.answer("❌ Отменено.")
+    
+    users = db_get_all_users()
+    succ, fail = 0, 0
+    m = await message.answer("⏳ Начинаю рассылку...")
+    
+    for u in users:
+        try:
+            await message.send_copy(chat_id=u['id'])
+            succ += 1
+            await asyncio.sleep(0.05) # Защита от лимитов телеграма
+        except Exception:
+            fail += 1
+            
+    await m.edit_text(f"✅ Рассылка завершена!\nУспешно: {succ}\nЗаблокировали бота: {fail}")
+    await state.clear()
+
+@dp.message(F.text.in_(["📋 Инфо о пользователе", "🚫 Бан", "✅ Разбан", "🎁 Выдать Premium", "💔 Забрать Premium"]), IsAdmin())
+async def admin_actions_start(message: Message, state: FSMContext):
+    action = message.text
+    await state.update_data(action_type=action)
+    await state.set_state(AdminActions.target_user_id)
+    await message.answer(f"Действие: <b>{action}</b>\n\nВведите ID пользователя:")
+
+@dp.message(AdminActions.target_user_id, IsAdmin())
+async def process_admin_action(message: Message, state: FSMContext):
+    if not message.text.isdigit(): return await message.answer("❌ ID должен состоять только из цифр.")
+    target_id = int(message.text)
+    data = await state.get_data()
+    action = data.get("action_type")
+    
+    user = db_get_user(target_id)
+    if not user:
+        await state.clear()
+        return await message.answer("❌ Пользователь не найден в базе.")
+
+    if "Инфо" in action:
+        prem = "Активен" if is_user_premium(user) else "Нет"
+        banned = "Да" if user['is_banned'] else "Нет"
+        bot_info = "Есть зеркало" if db_get_child_bot(target_id) else "Нет зеркала"
+        
+        await message.answer(f"📋 <b>Инфо:</b>\nID: <code>{user['id']}</code>\nИмя: {user['full_name']}\nЮзернейм: @{user['username']}\nБан: {banned}\nPremium: {prem}\nБот: {bot_info}")
+        await state.clear()
+        
+    elif "🚫 Бан" in action:
+        db_set_status(target_id, "is_banned", 1)
+        await message.answer(f"✅ Пользователь {target_id} заблокирован.")
+        try: await bot.send_message(target_id, "🚫 <b>Внимание: Ваш аккаунт заблокирован администрацией платформы.</b>")
+        except: pass
+        await state.clear()
+        
+    elif "Разбан" in action:
+        db_set_status(target_id, "is_banned", 0)
+        await message.answer(f"✅ Пользователь {target_id} разблокирован.")
+        try: await bot.send_message(target_id, "✅ <b>Блокировка снята. Вы снова можете пользоваться платформой!</b>")
+        except: pass
+        await state.clear()
+        
+    elif "💔" in action:
+        db_set_status(target_id, "premium", 0)
+        db_set_status(target_id, "premium_expires", 0)
+        await message.answer(f"✅ Premium у {target_id} изъят.")
+        try: await bot.send_message(target_id, "💔 <b>Ваш Premium-статус был аннулирован администрацией.</b>")
+        except: pass
+        await state.clear()
+        
+    elif "🎁" in action:
+        await state.update_data(target_id=target_id)
+        await message.answer(f"На какой срок выдать Premium пользователю {target_id}?", reply_markup=get_premium_durations_kb())
+        await state.set_state(AdminActions.premium_duration)
+
+@dp.callback_query(F.data.startswith("prem_"), AdminActions.premium_duration)
+async def process_give_premium(call: CallbackQuery, state: FSMContext):
+    seconds = int(call.data.split("_")[1])
+    data = await state.get_data()
+    target_id = data.get("target_id")
+    
+    expires_at = int(time.time()) + seconds if seconds > 0 else 0
+    db_set_premium(target_id, expires_at)
+    
+    term_str = "навсегда" if seconds == 0 else f"на {seconds // 86400} дней/дня"
+    await call.message.edit_text(f"✅ Premium успешно выдан пользователю {target_id} {term_str}.")
+    
+    try: 
+        await bot.send_message(target_id, f"🎉 <b>Поздравляем! Администрация выдала вам Premium статус {term_str}!</b>\n\nВсе функции вашего бота разблокированы.")
+    except: 
+        pass
+    await state.clear()
+
+
+# ==================== ДВИЖОК ДОЧЕРНИХ БОТОВ (SaaS) ====================
+
+async def launch_child_bot(token: str, owner_id: int):
+    try:
+        child_bot = Bot(token=token, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
+        child_dp = Dispatcher(storage=MemoryStorage())
+        
+        def get_child_kb():
+            return ReplyKeyboardMarkup(keyboard=[
+                [KeyboardButton(text="✉️ Написать владельцу"), KeyboardButton(text="ℹ️ Инфо")],
+                [KeyboardButton(text="👤 Мой профиль")]
+            ], resize_keyboard=True)
+
+        def get_watermark():
+            owner_data = db_get_user(owner_id)
+            if is_user_premium(owner_data):
+                return "" # Полный White-Label для премиума!
+            return f"\n\n⚡️ <i>Создано с помощью @{MAIN_BOT_USERNAME}</i>"
+
+        @child_dp.message(CommandStart())
+        async def child_start(message: Message, state: FSMContext):
+            await state.clear()
+            owner_info = db_get_user(owner_id)
+            name = owner_info['full_name'] if owner_info else "Владельца"
+            
+            text = (f"👋 <b>Добро пожаловать!</b>\n\n"
+                    f"Это официальный бот для безопасной связи с <b>{name}</b>.\n"
+                    f"Воспользуйтесь меню ниже для навигации.{get_watermark()}")
+            await message.answer(text, reply_markup=get_child_kb())
+
+        @child_dp.message(F.text == "👤 Мой профиль")
+        async def child_profile(message: Message):
+            text = (f"👤 <b>Ваш профиль в системе:</b>\n\n"
+                    f"<b>Имя:</b> {message.from_user.full_name}\n"
+                    f"<b>ID:</b> <code>{message.from_user.id}</code>")
+            await message.answer(text)
+
+        @child_dp.message(F.text == "ℹ️ Инфо")
+        async def child_info(message: Message):
+            bot_data = db_get_child_bot(owner_id)
+            if not bot_data: return await message.answer("❌ Информация временно недоступна.")
+            text = (f"ℹ️ <b>Информация о владельце:</b>\n\n"
+                    f"📋 <b>Описание/Услуги:</b>\n{bot_data['bio']}\n\n"
+                    f"🕒 <b>Часы работы:</b> {bot_data['working_hours']}{get_watermark()}")
+            await message.answer(text)
+
+        @child_dp.message(Command("reply"))
+        async def child_owner_reply(message: Message):
+            # Проверка, что команду отправляет именно владелец
+            if message.from_user.id != owner_id: return
+            args = message.text.split(maxsplit=2)
+            if len(args) < 3:
+                return await message.answer("ℹ️ <b>Используйте:</b> <code>/reply [ID_клиента] [Текст ответа]</code>")
+            
+            try:
+                wm = get_watermark()
+                await child_bot.send_message(int(args[1]), f"📩 <b>Новое сообщение от владельца:</b>\n\n{args[2]}{wm}")
+                await message.answer(f"✅ Успешно отправлено пользователю <code>{args[1]}</code>.")
+            except Exception as e:
+                await message.answer(f"❌ Ошибка отправки (Возможно, клиент заблокировал бота): {e}")
+
+        @child_dp.message(F.text == "✉️ Написать владельцу")
+        async def child_contact(message: Message, state: FSMContext):
+            await message.answer("Выберите причину обращения:", reply_markup=get_categories_kb(prefix="ch_cat_"))
+            await state.set_state(ChildBotStates.choosing_category)
+
+        @child_dp.callback_query(F.data.startswith("ch_cat_"), ChildBotStates.choosing_category)
+        async def child_cat_chosen(call: CallbackQuery, state: FSMContext):
+            if call.data == "ch_cat_cancel":
+                await state.clear()
+                return await call.message.edit_text("❌ Отменено.")
+            cats = {"ch_cat_question": "❓ Вопрос", "ch_cat_problem": "⚠️ Проблема", "ch_cat_collab": "🤝 Предложение", "ch_cat_idea": "💡 Идея"}
+            cat = cats.get(call.data, "Другое")
+            await state.update_data(category=cat)
+            await call.message.edit_text(f"Категория: <b>{cat}</b>\n\n✏️ Напишите ваше сообщение, и оно будет немедленно передано владельцу:")
+            await state.set_state(ChildBotStates.writing_message)
+
+        @child_dp.message(ChildBotStates.writing_message)
+        async def child_receive(message: Message, state: FSMContext):
+            bot_data = db_get_child_bot(owner_id)
+            
+            # Проверка антиспама
+            if bot_data and bot_data['spam_filter'] == 1 and len(message.text) < 15:
+                return await message.answer("🛡 <b>Защита от спама:</b> Ваше сообщение слишком короткое (минимум 15 символов). Пожалуйста, опишите суть подробнее.")
+
+            data = await state.get_data()
+            user = message.from_user
+            username = f"@{user.username}" if user.username else "Скрыт"
+            
+            admin_text = (f"🔔 <b>НОВОЕ ОБРАЩЕНИЕ ОТ КЛИЕНТА</b>\n"
+                          f"<b>Категория:</b> {data.get('category')}\n"
+                          f"<b>От:</b> {user.full_name} ({username})\n"
+                          f"<b>ID Клиента:</b> <code>{user.id}</code>\n\n"
+                          f"💬 <b>Текст:</b>\n{message.text}\n\n"
+                          f"<i>Для ответа клиенту прямо отсюда, напишите команду:</i>\n<code>/reply {user.id} Ваш текст</code>")
+            try:
+                # Отправляем сообщение владельцу в зеркального бота (или можно в основного, но логичнее в зеркального)
+                await child_bot.send_message(owner_id, admin_text)
+                await message.answer(f"✅ <b>Сообщение успешно доставлено владельцу!</b>{get_watermark()}", reply_markup=get_child_kb())
+            except Exception as e:
+                logger.error(f"Owner {owner_id} blocked their own bot: {e}")
+                await message.answer("❌ Произошла ошибка. Владелец временно не может принимать сообщения.")
+            await state.clear()
+
+        logger.info(f"🟢 Поднят дочерний бот для владельца ID {owner_id}")
+        await child_dp.start_polling(child_bot, handle_signals=False) # handle_signals=False важно для параллельной работы!
+        
+    except TelegramAPIError as e:
+        logger.error(f"🔴 Ошибка API Telegram для бота {owner_id} (Неверный токен?): {e}")
+    except Exception as e:
+        logger.error(f"🔴 Критическая ошибка в дочернем боте {owner_id}: {e}")
+    finally:
+        if owner_id in running_child_bots:
+            del running_child_bots[owner_id]
+
+# ==================== ЗАПУСК ПЛАТФОРМЫ ====================
+
+async def main():
+    init_db()
+    
+    global MAIN_BOT_USERNAME
+    try:
+        me = await bot.get_me()
+        MAIN_BOT_USERNAME = me.username
+        logger.info(f"🚀 Запуск ядра платформы: @{MAIN_BOT_USERNAME}")
+    except Exception:
+        logger.error("❌ НЕВЕРНЫЙ ТОКЕН ОСНОВНОГО БОТА В ФАЙЛЕ!")
+        return
+    
+    # Поднимаем всех ботов из БД
+    bots = db_get_all_bots()
+    for b in bots:
+        task = asyncio.create_task(launch_child_bot(b['bot_token'], b['owner_id']))
+        running_child_bots[b['owner_id']] = task
+        
+    logger.info(f"🔄 Восстановлено дочерних ботов: {len(running_child_bots)}")
+    
+    try:
+        await dp.start_polling(bot)
+    finally:
+        # Корректное завершение при остановке скрипта
+        for t in running_child_bots.values():
+            t.cancel()
+        logger.info("🛑 Платформа остановлена.")
+
+if __name__ == "__main__":
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        pass
